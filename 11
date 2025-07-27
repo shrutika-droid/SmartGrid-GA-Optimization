@@ -1,0 +1,306 @@
+
+
+!pip install pygad matplotlib seaborn --quiet
+
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pygad
+import time
+import multiprocessing
+from scipy.ndimage import uniform_filter1d
+sns.set(style="whitegrid")
+
+
+NUM_NODES = 50
+NUM_SOURCES = 3
+HOURS = 24
+
+# New node categories
+node_types = np.random.choice(
+    ['urban_res', 'rural_res', 'hospital', 'school', 'industry', 'mall', 'agriculture'],
+    size=NUM_NODES
+)
+
+demand_matrix = np.zeros((NUM_NODES, HOURS))
+
+for i, typ in enumerate(node_types):
+    if typ == 'urban_res':
+        base = 60 + 40 * np.sin((np.linspace(0, 2*np.pi, HOURS) - np.pi/3))**2
+    elif typ == 'rural_res':
+        base = 40 + 25 * np.sin((np.linspace(0, 2*np.pi, HOURS) - np.pi/2))**2
+    elif typ == 'hospital':
+        base = 150 + 20 * np.ones(HOURS) + np.random.normal(0, 5, HOURS)
+    elif typ == 'school':
+        base = np.where((np.arange(HOURS) >= 8) & (np.arange(HOURS) <= 14), 90, 30)
+    elif typ == 'industry':
+        base = 200 + 50 * np.sin((np.linspace(0, np.pi, HOURS)))**2
+    elif typ == 'mall':
+        base = 60 + 30 * np.sin((np.linspace(0, 2*np.pi, HOURS) - np.pi))**2
+    else:  # agriculture
+        base = 80 + 40 * np.cos((np.linspace(0, np.pi, HOURS)))**2
+
+    demand_matrix[i] = base + np.random.normal(0, 8, HOURS)
+
+# === ENERGY SOURCE CAPACITY ===
+solar = np.clip(np.sin(np.linspace(0, np.pi, HOURS)) * 1000 + 200, 0, 1200)
+cloud_factor = np.random.uniform(0.5, 1.0, HOURS)
+solar *= cloud_factor  # apply cloud-based dimming
+
+wind = np.random.normal(loc=600, scale=200, size=HOURS)
+wind = np.clip(wind, 100, 900)
+
+hydro = np.full(HOURS, 700) + np.random.normal(0, 60, HOURS)
+
+source_capacity = np.stack([solar, wind, hydro])
+source_cost = np.array([3.5, 2.8, 2.0])  # solar > wind > hydro
+line_loss = np.random.uniform(0.01, 0.1, size=(NUM_SOURCES, NUM_NODES))
+
+# === OUTAGES
+for s in range(NUM_SOURCES):
+    for _ in range(np.random.randint(1, 3)):  # multiple dips
+        start = np.random.randint(6, 18)
+        duration = np.random.randint(1, 4)
+        source_capacity[s, start:start+duration] *= np.random.uniform(0.1, 0.4)
+
+# === DEMAND SPIKES (simulate unplanned events)
+spike_nodes = np.random.choice(NUM_NODES, size=5, replace=False)
+for node in spike_nodes:
+    h = np.random.randint(0, 24)
+    demand_matrix[node, h] += np.random.uniform(80, 150)
+
+
+
+plt.figure(figsize=(10, 4))
+for i, label in enumerate(['Solar', 'Wind', 'Hydro']):
+    plt.plot(source_capacity[i], label=label)
+plt.title("Source Capacity with Cloud + Variability")
+plt.xlabel("Hour")
+plt.ylabel("kWh Available")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+def decode_chromosome(chrom):
+    return chrom.reshape((NUM_SOURCES, NUM_NODES, HOURS))
+
+def fitness_func(ga_instance, solution, solution_idx):
+    allocation = decode_chromosome(solution)
+    total_alloc = np.sum(allocation, axis=0)
+
+    unmet = np.maximum(0, demand_matrix - total_alloc)
+    over_alloc = np.maximum(0, total_alloc - demand_matrix)
+    source_usage = np.sum(allocation, axis=1)
+
+    capacity_violation = np.maximum(0, source_usage - source_capacity)
+    loss = allocation * line_loss[:, :, np.newaxis]
+    loss_cost = np.sum(loss)
+
+    energy_cost = np.sum(allocation * source_cost[:, np.newaxis, np.newaxis])
+    unmet_penalty = np.sum(unmet**1.5) * 10
+    over_penalty = np.sum(over_alloc**1.2) * 5
+    capacity_penalty = np.sum(capacity_violation) * 15
+
+    # Optional noise for exploration
+    noise = np.random.uniform(-50, 50)
+
+    return -(energy_cost + loss_cost + unmet_penalty + over_penalty + capacity_penalty) + noise
+
+fitness_std_history_serial = []
+fitness_std_history_parallel = []
+active_tracker = None  # Will switch between serial/parallel
+
+def on_generation(ga_instance):
+    global active_tracker
+    if active_tracker is not None:
+        std = np.std(ga_instance.last_generation_fitness)
+        active_tracker.append(std)
+
+def run_ga(parallel=False, tracker=None):
+    global active_tracker
+    active_tracker = tracker  # Set globally
+
+    gene_space = {'low': 0, 'high': 300}
+    parallel_processing = ["process", multiprocessing.cpu_count()] if parallel else None
+
+    ga = pygad.GA(
+        num_generations=15,
+        sol_per_pop=100,
+        num_parents_mating=20,
+        num_genes=NUM_SOURCES * NUM_NODES * HOURS,
+        gene_space=gene_space,
+        mutation_percent_genes=20,
+        mutation_probability=0.3,
+        parent_selection_type="tournament",
+        K_tournament=5,
+        crossover_type="single_point",
+        keep_parents=5,
+        fitness_func=fitness_func,
+        stop_criteria=None,
+        suppress_warnings=True,
+        parallel_processing=parallel_processing,
+        on_generation=on_generation  #  Now safely global
+    )
+
+    start = time.time()
+    ga.run()
+    end = time.time()
+
+    return ga, end - start
+
+ga_serial, serial_time = run_ga(parallel=False, tracker=fitness_std_history_serial)
+ga_parallel, parallel_time = run_ga(parallel=True, tracker=fitness_std_history_parallel)
+# Print execution times and speedup
+print(f"Serial Time: {serial_time:.2f}s")
+print(f"Parallel Time: {parallel_time:.2f}s")
+print(f"Speedup: {serial_time / parallel_time:.2f}x")
+
+# Raw best fitness values
+raw_serial = np.array(ga_serial.best_solutions_fitness)
+raw_parallel = np.array(ga_parallel.best_solutions_fitness)
+
+# Monotonic best-so-far curves
+mono_serial = np.maximum.accumulate(raw_serial)
+mono_parallel = np.maximum.accumulate(raw_parallel)
+
+# Smoothed with moving average (window=3)
+smooth_serial = uniform_filter1d(raw_serial, size=3)
+smooth_parallel = uniform_filter1d(raw_parallel, size=3)
+
+# Plot: Raw + Smoothed + Monotonic
+plt.figure(figsize=(14, 5))
+plt.plot(raw_serial, label="Serial (Raw)", color="blue", alpha=0.5, linestyle="--")
+plt.plot(smooth_serial, label="Serial (Smoothed)", color="blue")
+plt.plot(mono_serial, label="Serial (Best So Far)", color="navy")
+
+plt.plot(raw_parallel, label="Parallel (Raw)", color="green", alpha=0.5, linestyle="--")
+plt.plot(smooth_parallel, label="Parallel (Smoothed)", color="green")
+plt.plot(mono_parallel, label="Parallel (Best So Far)", color="darkgreen")
+
+plt.title("Convergence Curves: Raw, Smoothed & Monotonic")
+plt.xlabel("Generation")
+plt.ylabel("Fitness Score")
+plt.grid(True)
+plt.legend()
+plt.show()
+
+# Convergence
+plt.figure(figsize=(12, 6))
+plt.plot(ga_serial.best_solutions_fitness, label=f"Serial ( {serial_time:.2f}s)", linestyle='--', marker='o')
+plt.plot(ga_parallel.best_solutions_fitness, label=f"Parallel ( {parallel_time:.2f}s)", linestyle='-', marker='s')
+plt.title("Convergence Curve: Best Fitness Over Generations")
+plt.xlabel("Generation")
+plt.ylabel("Fitness")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# Diversity
+plt.figure(figsize=(12, 4))
+plt.plot(fitness_std_history_serial, label="Serial Diversity", color='blue')
+plt.plot(fitness_std_history_parallel, label="Parallel Diversity", color='green')
+plt.title("Fitness Std Dev per Generation (Diversity)")
+plt.xlabel("Generation")
+plt.ylabel("Standard Deviation")
+plt.grid(True)
+plt.legend()
+plt.show()
+
+serial_cost = -ga_serial.best_solution()[1]
+parallel_cost = -ga_parallel.best_solution()[1]
+
+plt.bar(["Serial GA", "Parallel GA"], [serial_cost, parallel_cost], color=["blue", "green"])
+plt.title("Final Energy Cost (Lower is Better)")
+plt.ylabel("Total Cost (Rs)")
+plt.grid(True, axis='y')
+plt.show()
+
+plt.figure(figsize=(12, 6))
+
+# Plot raw fitness
+plt.plot(ga_serial.best_solutions_fitness, label=f"Serial GA ( {serial_time:.2f}s)", color='blue', linestyle='--', marker='o')
+plt.plot(ga_parallel.best_solutions_fitness, label=f"Parallel GA ( {parallel_time:.2f}s)", color='green', linestyle='-', marker='s')
+
+# Optionally smooth the curve (with moving average)
+def smooth(y, window=3):
+    return np.convolve(y, np.ones(window)/window, mode='valid')
+
+plt.plot(smooth(ga_serial.best_solutions_fitness), color='blue', alpha=0.3, label="Serial (Smoothed)")
+plt.plot(smooth(ga_parallel.best_solutions_fitness), color='green', alpha=0.3, label="Parallel (Smoothed)")
+
+plt.title("Convergence Curve: Best Fitness Over Generations")
+plt.xlabel("Generation")
+plt.ylabel("Best Fitness")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+best_gen_serial = np.argmax(raw_serial)
+best_gen_parallel = np.argmax(raw_parallel)
+print(f" Serial best at generation: {best_gen_serial}")
+print(f" Parallel best at generation: {best_gen_parallel}")
+
+# Greedy Baseline
+
+# GREEDY BASELINE
+def greedy_allocation():
+    allocation = np.zeros((NUM_SOURCES, NUM_NODES, HOURS))
+
+    for h in range(HOURS):
+        # sort sources by cost at this hour
+        source_order = np.argsort(source_cost)
+        remaining_capacity = source_capacity[:, h].copy()
+
+        for n in range(NUM_NODES):
+            demand = demand_matrix[n, h]
+            for s in source_order:
+                if demand <= 0:
+                    break
+                available = remaining_capacity[s]
+                supply = min(available, demand / (1 - line_loss[s, n]))
+                allocation[s, n, h] = supply
+                remaining_capacity[s] -= supply
+                demand -= supply * (1 - line_loss[s, n])
+
+    return allocation
+
+def evaluate_greedy(allocation):
+    total_alloc = np.sum(allocation, axis=0)
+    unmet = np.maximum(0, demand_matrix - total_alloc)
+    over_alloc = np.maximum(0, total_alloc - demand_matrix)
+    source_usage = np.sum(allocation, axis=1)
+
+    capacity_violation = np.maximum(0, source_usage - source_capacity)
+    loss = allocation * line_loss[:, :, np.newaxis]
+    loss_cost = np.sum(loss)
+
+    energy_cost = np.sum(allocation * source_cost[:, np.newaxis, np.newaxis])
+    unmet_penalty = np.sum(unmet**1.5) * 10
+    over_penalty = np.sum(over_alloc**1.2) * 5
+    capacity_penalty = np.sum(capacity_violation) * 15
+
+    total_cost = energy_cost + loss_cost + unmet_penalty + over_penalty + capacity_penalty
+    return total_cost
+
+
+
+# Run Greedy
+start = time.time()
+greedy_alloc = greedy_allocation()
+end = time.time()
+greedy_cost = evaluate_greedy(greedy_alloc)
+greedy_time = end - start
+
+print(f" Greedy Baseline Cost: {greedy_cost:.2f}")
+print(f" Greedy Execution Time: {greedy_time:.4f}s")
+
+# Compare GA vs Greedy
+plt.bar(["Serial GA", "Parallel GA", "Greedy"],
+        [serial_cost, parallel_cost, greedy_cost],
+        color=["blue", "green", "orange"])
+plt.title("Final Energy Cost Comparison")
+plt.ylabel("Total Cost (Rs)")
+plt.grid(True, axis='y')
+plt.show()
